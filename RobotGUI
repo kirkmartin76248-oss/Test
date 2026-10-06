@@ -1,0 +1,788 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import os
+import io
+import time
+import datetime as dt
+from datetime import timedelta
+import threading
+from robot.api import TestSuiteBuilder
+from robot.result import ExecutionResult
+import xml.etree.ElementTree as ET
+import robot
+
+# -------------------------------------------------------------------------
+# Window Initialization & Modern Corporate Theme Config
+# -------------------------------------------------------------------------
+root = tk.Tk()
+root.title("Robot Test Runner 47")
+root.geometry("1200x1000")  # Marginally adjusted height to cleanly seat the artifact dashboard
+root.configure(bg="#2D3748")
+
+# Initialize global application state variables safely after window definition context
+abort_execution = tk.BooleanVar(value=False)
+test_thread = None
+
+# State trackers for report file generation permission controls
+generate_output = tk.BooleanVar(value=False)
+generate_log = tk.BooleanVar(value=True)
+generate_report = tk.BooleanVar(value=True)
+last_report_path = tk.StringVar(value="")
+
+# Main UI layout variable elements
+merge_test = tk.BooleanVar()
+use_loop = tk.BooleanVar()
+loop_var = tk.IntVar(value=0)
+iter_var = tk.StringVar(value="Iteration: 0")
+
+style = ttk.Style()
+style.theme_use('clam')
+style.configure('.', font=('Segoe UI', 10), background='#2D3748', foreground='#F7FAFC')
+
+# Core Component Theme Maps
+style.configure('Treeview', 
+                font=('Segoe UI', 10), 
+                background='#1A202C', 
+                fieldbackground='#1A202C', 
+                foreground='#E2E8F0', 
+                rowheight=26)
+style.configure('Treeview.Heading', font=('Segoe UI', 10, 'bold'), background='#4A5568', foreground='#FFFFFF')
+style.map('Treeview', background=[('selected', '#3182CE')])
+
+style.configure('Action.TButton', font=('Segoe UI', 10, 'bold'), foreground='#FFFFFF')
+style.configure('Primary.TButton', background='#3182CE')
+style.map('Primary.TButton', background=[('active', '#2B6CB0')])
+style.configure('Danger.TButton', background='#E53E3E')
+style.map('Danger.TButton', background=[('active', '#C53030')])
+style.configure('Run.TButton', font=('Segoe UI', 12, 'bold'), background='#48BB78', foreground='#FFFFFF')
+style.map('Run.TButton', background=[('active', '#38A169')])
+
+style.configure('Icon.TButton', font=('Segoe UI', 10), background='#4A5568', foreground='#FFFFFF', padding=2)
+style.map('Icon.TButton', background=[('active', '#718096')])
+
+style.configure('TCombobox', font=('Segoe UI', 10), foreground='#000000', background='#FFFFFF', fieldbackground='#FFFFFF')
+style.map('TCombobox', 
+          foreground=[('readonly', '#000000')], 
+          fieldbackground=[('readonly', '#FFFFFF')],
+          background=[('readonly', '#E2E8F0')])
+
+style.configure('TCheckbutton', font=('Segoe UI', 10), background='#2D3748', foreground='#E2E8F0')
+style.map('TCheckbutton', background=[('active', '#2D3748')], foreground=[('active', '#E2E8F0')])
+style.configure('TRadiobutton', font=('Segoe UI', 10), background='#1A202C', foreground='#E2E8F0')
+style.map('TRadiobutton', background=[('active', '#1A202C')], foreground=[('active', '#E2E8F0')])
+style.configure('TLabelframe', font=('Segoe UI', 10, 'bold'), background='#2D3748', foreground='#CBD5E0')
+style.configure('TLabelframe.Label', background='#2D3748', foreground='#CBD5E0')
+style.configure('TLabel', font=('Segoe UI', 10), background='#2D3748', foreground='#E2E8F0')
+
+# Force pop-up Combobox options menus to load with clean black text on white
+root.option_add('*TCombobox*Listbox.background', '#FFFFFF')
+root.option_add('*TCombobox*Listbox.foreground', '#000000')
+root.option_add('*TCombobox*Listbox.font', ('Segoe UI', 10))
+
+checked = {}
+file_paths = {}
+
+# -------------------------------------------------------------------------
+# Real-Time Robot Framework Listener Component
+# -------------------------------------------------------------------------
+class LiveGuiListener:
+    """Robot Framework Listener to push live execution events straight to the GUI."""
+    ROBOT_LISTENER_API_VERSION = 2
+
+    def __init__(self, console_widget, tree_widget, file_paths_dict, current_iter):
+        self.console = console_widget
+        self.tree = tree_widget
+        self.file_paths = file_paths_dict
+        self.iteration = current_iter
+
+    def _append_to_console(self, label_text, value_text, status_tag):
+        """Helper to unlock, write, scroll, and refresh the UI thread safely."""
+        if abort_execution.get():
+            return
+            
+        time_str = dt.datetime.now().strftime('%H:%M:%S')
+        
+        self.console.configure(state='normal')
+        self.console.insert(tk.END, f"[{time_str}] ", "INFO")
+        self.console.insert(tk.END, f"Iter {self.iteration} | ", "INFO")
+        self.console.insert(tk.END, f"{label_text} ")
+        self.console.insert(tk.END, f"{value_text}\n", status_tag)
+        self.console.see(tk.END)
+        self.console.configure(state='disabled')
+        self.console.update_idletasks()
+
+    def start_suite(self, name, attributes):
+        if abort_execution.get():
+            raise SystemExit("Execution explicitly killed by GUI operator.")
+        self._append_to_console(f"SUITE: {name.upper()}", "TEST SUITE STARTED", "INFO")
+
+    def start_test(self, name, attributes):
+        if abort_execution.get():
+            raise SystemExit("Execution explicitly killed by GUI operator.")
+
+    def end_test(self, name, attributes):
+        if abort_execution.get():
+            return
+            
+        status = attributes['status']
+        self._append_to_console(f"  Test: {name} Status:", status, status)
+        
+        for parent_iid in self.tree.get_children():
+            file_path = self.file_paths.get(parent_iid, "")
+            child_iid = f"{file_path}:{name}"
+            if child_iid in self.tree.get_children(parent_iid):
+                current_vals = self.tree.item(child_iid)['values']
+                if current_vals:
+                    skip_box = str(current_vals[0]).strip()
+                    test_name = str(current_vals[1]).strip()
+                    self.tree.item(child_iid, values=(skip_box, test_name, status), tags=(f"{status}_ROW",))
+                self.tree.update_idletasks()
+
+    def end_suite(self, name, attributes):
+        if abort_execution.get():
+            return
+            
+        status = attributes['status']
+        for parent_iid in self.tree.get_children():
+            file_path = self.file_paths.get(parent_iid, "")
+            basename = os.path.splitext(os.path.basename(file_path))[0]
+            basename_clean = basename.replace('_', ' ')
+            if name.lower() == basename_clean.lower() or name.lower() == basename.lower():
+                current_vals = self.tree.item(parent_iid)['values']
+                if current_vals:
+                    skip_box = str(current_vals[0]).strip()
+                    suite_name = str(current_vals[1]).strip()
+                    self.tree.item(parent_iid, values=(skip_box, suite_name, status), tags=(f"{status}_ROW",))
+                self.tree.update_idletasks()
+
+# -------------------------------------------------------------------------
+# Interactive Date/Time Modal Picker Component
+# -------------------------------------------------------------------------
+def open_datetime_picker(target_entry):
+    picker = tk.Toplevel(root)
+    picker.title("Select Date & Time")
+    picker.geometry("310x240")
+    picker.configure(bg="#2D3748")
+    picker.transient(root)
+    picker.grab_set()
+
+    picker.geometry(f"+{root.winfo_x() + 400}+{root.winfo_y() + 200}")
+
+    try:
+        current_dt = dt.datetime.strptime(target_entry.get().strip(), '%Y-%m-%d %H:%M')
+    except ValueError:
+        current_dt = dt.datetime.now()
+
+    lbl_title = ttk.Label(picker, text="Set Execution Schedule Constraints", font=('Segoe UI', 10, 'bold'), background='#2D3748')
+    lbl_title.pack(pady=(15, 10))
+
+    frame_selectors = tk.Frame(picker, bg="#2D3748")
+    frame_selectors.pack(pady=5)
+
+    ttk.Label(frame_selectors, text="Date:", background='#2D3748').grid(row=0, column=0, padx=5, shadow=5, pady=5, sticky='w')
+    frame_date_inputs = tk.Frame(frame_selectors, bg="#2D3748")
+    frame_date_inputs.grid(row=0, column=1, padx=5, pady=5)
+    
+    combo_year = ttk.Combobox(frame_date_inputs, values=[str(y) for y in range(2026, 2036)], width=5, state="readonly")
+    combo_year.set(current_dt.strftime('%Y'))
+    combo_year.pack(side='left', padx=2)
+
+    combo_month = ttk.Combobox(frame_date_inputs, values=[f"{m:02d}" for m in range(1, 13)], width=3, state="readonly")
+    combo_month.set(current_dt.strftime('%m'))
+    combo_month.pack(side='left', padx=2)
+
+    combo_day = ttk.Combobox(frame_date_inputs, values=[f"{d:02d}" for d in range(1, 32)], width=3, state="readonly")
+    combo_day.set(current_dt.strftime('%d'))
+    combo_day.pack(side='left', padx=2)
+
+    ttk.Label(frame_selectors, text="Time:", background='#2D3748').grid(row=1, column=0, padx=5, pady=5, sticky='w')
+    frame_time_inputs = tk.Frame(frame_selectors, bg="#2D3748")
+    frame_time_inputs.grid(row=1, column=1, padx=5, pady=5, sticky='w')
+    
+    combo_hour = ttk.Combobox(frame_time_inputs, values=[f"{h:02d}" for h in range(0, 24)], width=3, state="readonly")
+    combo_hour.set(current_dt.strftime('%H'))
+    combo_hour.pack(side='left', padx=2)
+
+    ttk.Label(frame_time_inputs, text=":", background='#2D3748').pack(side='left')
+
+    combo_min = ttk.Combobox(frame_time_inputs, values=[f"{m:02d}" for m in range(0, 60)], width=3, state="readonly")
+    combo_min.set(current_dt.strftime('%M'))
+    combo_min.pack(side='left', padx=2)
+
+    def save_selection():
+        formatted_str = f"{combo_year.get()}-{combo_month.get()}-{combo_day.get()} {combo_hour.get()}:{combo_min.get()}"
+        target_entry.delete(0, tk.END)
+        target_entry.insert(0, formatted_str)
+        picker.destroy()
+
+    btn_save = ttk.Button(picker, text="Apply Timeline Parameters", style='Primary.TButton', command=save_selection)
+    btn_save.pack(pady=20)
+
+# -------------------------------------------------------------------------
+# File Management & Checkbox Matrix Callbacks
+# -------------------------------------------------------------------------
+def on_click(event):
+    col = tree.identify_column(event.x)
+    if col == '#1':
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        values = tree.item(item)['values']
+        if not values:
+            return
+            
+        box = str(values[0]).strip()
+        name = str(values[1]).strip()
+        status = str(values[2]).strip() if len(values) > 2 else ""
+        
+        if item in checked:
+            ch = checked[item]
+            if ".robot" in name:
+                new = '[x]' if not ch else '[ ]'
+            elif '└' in box or '[' in box:
+                new = '└[x]' if not ch else '└[ ]'
+            else:                
+                new = ''
+                
+            if '[x]' in new:
+                checked[item] = True
+                tree.item(item, values=(new, name, status), tags=("skip",))
+            else:
+                checked[item] = False
+                tree.item(item, values=(new, name, status), tags=("noskip",))
+
+def select_files():
+    files = filedialog.askopenfilenames(filetypes=[('Robot files', '*.robot')])
+    for f in files:
+        if f in file_paths.values():
+            continue
+        try:
+            tag = "parent"
+            suite = TestSuiteBuilder().build(f)
+            basename = os.path.basename(f)
+            parent_iid = f
+            tree.insert('', 'end', iid=parent_iid, values=('[ ]', basename, ''), tags=(tag,))
+            checked[parent_iid] = False
+            file_paths[parent_iid] = f
+            if not suite.tests:
+                messagebox.showwarning("Warning", f"No tests found in {basename}")
+            for test in suite.tests:
+                child_iid = f"{f}:{test.name}"
+                check_value = '└[ ]' if test.tags else ''
+                tree.insert(parent_iid, 'end', iid=child_iid, values=(check_value, f'  {test.name}', ''))
+                if test.tags:
+                    checked[child_iid] = False
+            tree.item(parent_iid, open=True)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to parse {f}: {str(e)}")
+
+def delete_sel():
+    for s in list(tree.selection()):
+        for child in list(tree.get_children(s)):
+            if child in checked:
+                del checked[child]
+            tree.delete(child)
+
+        if s in file_paths:
+            del file_paths[s]
+        if s in checked:
+            del checked[s]
+            
+        if tree.exists(s):
+            tree.delete(s)
+            
+    tree.update_idletasks()
+
+# -------------------------------------------------------------------------
+# Dynamic Side-by-Side Framework Workspace Grid Setup
+# -------------------------------------------------------------------------
+frame_controls = tk.Frame(root, bg="#2D3748")
+frame_controls.pack(fill='x', padx=20, pady=(15, 5))
+
+btn_select = ttk.Button(frame_controls, text='Select Files', width=18, style='Primary.TButton', command=select_files)
+btn_select.pack(side='left', padx=(0, 10))
+
+btn_delete = ttk.Button(frame_controls, text='Delete Selected', width=18, style='Danger.TButton', command=delete_sel)
+btn_delete.pack(side='left')
+
+chk_merge = ttk.Checkbutton(frame_controls, text='Merge Test Executions', variable=merge_test)
+chk_merge.pack(side='right', padx=5)
+
+workspace_frame = tk.Frame(root, bg="#2D3748")
+workspace_frame.pack(fill='both', expand=True, padx=20, pady=5)
+
+# --- LEFT COLUMN: Tree Matrix ---
+left_column = tk.Frame(workspace_frame, bg="#2D3748")
+left_column.pack(side='left', fill='both', expand=True, padx=(0, 10))
+
+lbl_tree_header = ttk.Label(left_column, text=" Test Suites Matrix", font=('Segoe UI', 10, 'bold'), foreground='#A0AEC0')
+lbl_tree_header.pack(anchor='w', pady=(0, 5))
+
+frame_list = tk.Frame(left_column, bg="#2D3748")
+frame_list.pack(fill='both', expand=True)
+
+tree = ttk.Treeview(frame_list, columns=('check', 'name', 'status'), height=15, show='headings', selectmode='extended')
+tree.heading('check', text='Skip')
+tree.heading('name', text='Test Suite / Case Name')
+tree.heading('status', text='Execution Status')
+tree.column('check', width=55, anchor='center', stretch=False)
+tree.column('name', width=280, stretch=True)
+tree.column('status', width=110, anchor='center', stretch=False)
+
+scroll = ttk.Scrollbar(frame_list, orient="vertical", command=tree.yview)
+tree.configure(yscroll=scroll.set)
+tree.pack(side='left', fill='both', expand=True)
+scroll.pack(side='right', fill='y')
+
+tree.bind('<Button-1>', on_click)
+tree.tag_configure("parent", background="#2D3748", foreground="#FFFFFF")
+tree.tag_configure("skip", background="#4A4E59", foreground="#A0AEC0")
+tree.tag_configure("noskip", background="#1A202C", foreground="#E2E8F0")
+tree.tag_configure("PASS_ROW", foreground="#48BB78")
+tree.tag_configure("FAIL_ROW", foreground="#F56565")
+tree.tag_configure("SKIP_ROW", foreground="#ED8936")
+
+# --- RIGHT COLUMN: Console Shell ---
+right_column = tk.Frame(workspace_frame, bg="#2D3748")
+right_column.pack(side='right', fill='both', expand=True, padx=(10, 0))
+
+lbl_console_header = ttk.Label(right_column, text=" Real-Time Console Stream", font=('Segoe UI', 10, 'bold'), foreground='#A0AEC0')
+lbl_console_header.pack(anchor='w', pady=(0, 5))
+
+frame_console = tk.Frame(right_column, bg="#1A202C", bd=1, relief="solid")
+frame_console.pack(fill='both', expand=True)
+
+console_log = tk.Text(frame_console, bg='#1A202C', fg='#E2E8F0', font=('Consolas', 10), wrap='none', bd=0, highlightthickness=0)
+console_scroll = ttk.Scrollbar(frame_console, orient="vertical", command=console_log.yview)
+console_log.configure(yscrollcommand=console_scroll.set)
+console_log.pack(side='left', fill='both', expand=True)
+console_scroll.pack(side='right', fill='y')
+
+console_log.tag_configure("PASS", foreground="#48BB78")
+console_log.tag_configure("FAIL", foreground="#F56565")
+console_log.tag_configure("SKIP", foreground="#ED8936")
+console_log.tag_configure("INFO", foreground="#A0AEC0")
+console_log.configure(state='disabled')
+
+# Loop Modes Configuration Frame Component
+frame_loop = ttk.LabelFrame(root, text=' Loop Modes Configuration ', padding=12)
+frame_loop.pack(fill='x', padx=20, pady=10)
+
+chk_loop = ttk.Checkbutton(frame_loop, text='Enable Loop Mode Operations', variable=use_loop)
+chk_loop.pack(anchor='w', pady=(0, 8))
+
+subframe = tk.Frame(frame_loop, bg="#1A202C", bd=1, relief="solid")
+subframe.pack(fill='x', pady=2, ipady=3)
+rad_loops = ttk.Radiobutton(subframe, text='Execute Count Limit:', variable=loop_var, value=0)
+rad_loops.pack(side='left', padx=10)
+num_loops = tk.Entry(subframe, width=6, font=('Segoe UI', 10), bg="#2D3748", fg="#FFFFFF", insertbackground="#FFFFFF", bd=1)
+num_loops.pack(side='left', padx=5)
+
+def check_radio():
+    if loop_var.get() == 1:
+        now = dt.datetime.now()
+        start_entry.delete(0, tk.END)
+        start_entry.insert(0, now.strftime('%Y-%m-%d %H:%M'))
+        stop_entry.delete(0, tk.END)
+        stop_entry.insert(0, (now + timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M'))
+
+subframe2 = tk.Frame(frame_loop, bg="#1A202C", bd=1, relief="solid")
+subframe2.pack(fill='x', pady=2, ipady=3)
+rad_timer = ttk.Radiobutton(subframe2, text='Time-Window Lock:', variable=loop_var, value=1, command=check_radio)
+rad_timer.pack(side='left', padx=10)
+
+ttk.Label(subframe2, text='Start:', background='#1A202C').pack(side='left', padx=(5, 2))
+start_entry = tk.Entry(subframe2, width=16, font=('Segoe UI', 10), bg="#2D3748", fg="#FFFFFF", insertbackground="#FFFFFF", bd=1)
+start_entry.pack(side='left', padx=2)
+btn_clock_start = ttk.Button(subframe2, text="🕒", style='Icon.TButton', width=3, command=lambda: open_datetime_picker(start_entry))
+btn_clock_start.pack(side='left', padx=(0, 10))
+
+ttk.Label(subframe2, text='Stop:', background='#1A202C').pack(side='left', padx=(5, 2))
+stop_entry = tk.Entry(subframe2, width=16, font=('Segoe UI', 10), bg="#2D3748", fg="#FFFFFF", insertbackground="#FFFFFF", bd=1)
+stop_entry.pack(side='left', padx=2)
+btn_clock_stop = ttk.Button(subframe2, text="🕒", style='Icon.TButton', width=3, command=lambda: open_datetime_picker(stop_entry))
+btn_clock_stop.pack(side='left', padx=0)
+
+
+# -------------------------------------------------------------------------
+# Core Background Multi-Thread Testing Loop Engine
+# -------------------------------------------------------------------------
+def clear_treeview_statuses():
+    """Clears out all status values and colors from the treeview map before running a new loop."""
+    for parent_iid in tree.get_children():
+        current_vals = tree.item(parent_iid)['values']
+        if current_vals:
+            skip_box = str(current_vals[0]).strip()
+            suite_name = str(current_vals[1]).strip()
+            tree.item(parent_iid, values=(skip_box, suite_name, ""), tags=("parent",))
+            
+        for child_iid in tree.get_children(parent_iid):
+            child_vals = tree.item(child_iid)['values']
+            if child_vals:
+                c_skip_box = str(child_vals[0]).strip()
+                c_test_name = str(child_vals[1]).strip()
+                tag = "skip" if checked.get(child_iid, False) else "noskip"
+                tree.item(child_iid, values=(c_skip_box, c_test_name, ""), tags=(tag,))
+    tree.update_idletasks()
+
+def run_one(iteration):
+    ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    suffix = '' if iteration == 0 else f'-loop{iteration}'
+    std = io.StringIO()
+    
+    live_listener = LiveGuiListener(console_log, tree, file_paths, iteration)
+    
+    # -------------------------------------------------------------------------
+    # SECTION 1: MERGE TEST MODE (Run all files together)
+    # -------------------------------------------------------------------------
+    if merge_test.get():
+        selected_files = []
+        skipped_tests = []
+        for parent in tree.get_children():
+            if checked.get(parent, True):
+                continue
+            file = file_paths[parent]
+            try:
+                TestSuiteBuilder().build(file)
+                skipped = [str(tree.item(child)['values'][1]).strip() for child in tree.get_children(parent) if checked.get(child, False)]
+                skipped_tests.extend(f"{test_name}" for test_name in skipped)
+                selected_files.append(file)
+            except Exception as e:
+                console_log.configure(state='normal')
+                console_log.insert(tk.END, f"[ERROR] {file}: {str(e)}\n", "FAIL")
+                console_log.configure(state='disabled')
+                return
+                
+        if not selected_files:
+            console_log.configure(state='normal')
+            console_log.insert(tk.END, "[WARNING] No test targets selected for processing\n", "SKIP")
+            console_log.configure(state='disabled')
+            return
+            
+        # Define standard names so Robot Framework can compile successfully
+        out_name = f'output-{ts}-merged{suffix}.xml'
+        log_name = f'log-{ts}-merged{suffix}.html'
+        rep_name = f'report-{ts}-merged{suffix}.html'
+        
+        # Save the path to the "View Last Report" button tracker variable
+        last_report_path.set(rep_name)
+            
+        try:
+            args = {
+                'output': out_name, 'log': log_name, 'report': rep_name, 
+                'stdout': std, 'listener': live_listener
+            }
+            if skipped_tests:
+                args['skip'] = skipped_tests
+            
+            robot.run(*selected_files, **args)
+            
+            # FIXED: Direct post-run file cleanup based on user checkboxes
+            if not generate_output.get() and os.path.exists(out_name):
+                os.remove(out_name)
+            if not generate_log.get() and os.path.exists(log_name):
+                os.remove(log_name)
+            if not generate_report.get() and os.path.exists(rep_name):
+                os.remove(rep_name)
+                
+        except SystemExit:
+            return
+        except Exception as e:
+            console_log.configure(state='normal')
+            console_log.insert(tk.END, f"[ERROR] Merged suite execution failed: {str(e)}\n", "FAIL")
+            console_log.configure(state='disabled')
+            return
+
+    # -------------------------------------------------------------------------
+    # SECTION 2: NON-MERGE TEST MODE (Run each file separately)
+    # -------------------------------------------------------------------------
+    else:
+        selected_files = []
+        file_basenames = {}
+        skipped_tests = {}
+        for parent in tree.get_children():
+            if checked.get(parent, True):
+                continue
+            file = file_paths[parent]
+            try:
+                skipped_tests[file] = [str(tree.item(child)['values'][1]).strip() for child in tree.get_children(parent) if checked.get(child, False)]
+                selected_files.append(file)
+                file_basenames[file] = os.path.splitext(os.path.basename(file))[0]
+            except Exception as e:
+                console_log.configure(state='normal')
+                console_log.insert(tk.END, f"[ERROR] File execution path error: {str(e)}\n", "FAIL")
+                console_log.configure(state='disabled')
+                return
+                
+        if not selected_files:
+            console_log.configure(state='normal')
+            console_log.insert(tk.END, "[WARNING] No independent test targets selected\n", "SKIP")
+            console_log.configure(state='disabled')
+            return
+            
+        try:
+            for file in selected_files:
+                if abort_execution.get():
+                    break
+                    
+                basename = file_basenames[file]
+                
+                # Define standard names so Robot Framework can compile successfully
+                out_name = f'output-{ts}-{basename}{suffix}.xml'
+                log_name = f'log-{ts}-{basename}{suffix}.html'
+                rep_name = f'report-{ts}-{basename}{suffix}.html'
+                
+                # Save the path to the "View Last Report" button tracker variable
+                last_report_path.set(rep_name)
+                    
+                args = {
+                    'output': out_name, 'log': log_name, 'report': rep_name, 
+                    'stdout': std, 'listener': live_listener
+                }
+                if skipped_tests[file]:
+                    args['skip'] = skipped_tests[file]
+                
+                robot.run(file, **args)
+                
+                # FIXED: Direct post-run file cleanup based on user checkboxes
+                if not generate_output.get() and os.path.exists(out_name):
+                    os.remove(out_name)
+                if not generate_log.get() and os.path.exists(log_name):
+                    os.remove(log_name)
+                if not generate_report.get() and os.path.exists(rep_name):
+                    os.remove(rep_name)
+                    
+        except SystemExit:
+            return
+        except Exception as e:
+            console_log.configure(state='normal')
+            console_log.insert(tk.END, f"[ERROR] Execution pipeline faulted: {str(e)}\n", "FAIL")
+            console_log.configure(state='disabled')
+            return
+            
+    return std.getvalue() + '\n'
+
+# -------------------------------------------------------------------------
+# Asynchronous Background Scheduler Architecture & Run Processors
+# -------------------------------------------------------------------------
+def check_and_execute_timer_loop(start_dt, stop_dt, current_iteration=1):
+    """Asynchronous loop checking calendar intervals without blocking the main UI thread."""
+    if abort_execution.get():
+        console_log.configure(state='normal')
+        console_log.insert(tk.END, f"[{dt.datetime.now().strftime('%H:%M:%S')}] ", "INFO")
+        console_log.insert(tk.END, "[ABORT] Scheduled execution window cancelled by operator request.\n", "FAIL")
+        console_log.configure(state='disabled')
+        btn_run.configure(state='normal')
+        btn_stop.configure(state='disabled')
+        return
+
+    if not use_loop.get() or loop_var.get() != 1:
+        btn_run.configure(state='normal')
+        btn_stop.configure(state='disabled')
+        return 
+
+    now = dt.datetime.now()
+
+    if now < start_dt:
+        seconds_left = int((start_dt - now).total_seconds())
+        console_log.configure(state='normal')
+        console_log.delete("1.0", tk.END)
+        console_log.insert(tk.END, f"[{now.strftime('%H:%M:%S')}] [INFO] Waiting for scheduled time to start... ({seconds_left}s remaining)\n", "INFO")
+        console_log.configure(state='disabled')
+        root.after(1000, lambda: check_and_execute_timer_loop(start_dt, stop_dt, current_iteration))
+        return
+
+    if now < stop_dt:
+        global test_thread
+        if test_thread and test_thread.is_alive():
+            root.after(500, lambda: check_and_execute_timer_loop(start_dt, stop_dt, current_iteration))
+            return
+
+        iter_var.set(f"Iteration: {current_iteration}")
+        root.update_idletasks()
+        
+        clear_treeview_statuses()
+        
+        test_thread = threading.Thread(target=run_one, args=(current_iteration,), daemon=True)
+        test_thread.start()
+        
+        root.after(1000, lambda: check_and_execute_timer_loop(start_dt, stop_dt, current_iteration + 1))
+        return
+
+    console_log.configure(state='normal')
+    console_log.insert(tk.END, f"[{dt.datetime.now().strftime('%H:%M:%S')}] [INFO] Scheduled window complete. Reached stop threshold at: {stop_dt.strftime('%H:%M:%S')}\n", "INFO")
+    console_log.configure(state='disabled')
+    btn_run.configure(state='normal')
+    btn_stop.configure(state='disabled')
+
+
+def run_count_loop(total_loops, current_iteration=1):
+    """Executes a count-based loop using clean UI intervals, checking completion
+    statically after thread workflows complete instead of firing prematurely."""
+    global test_thread
+    
+    if abort_execution.get():
+        console_log.configure(state='normal')
+        console_log.insert(tk.END, f"[{dt.datetime.now().strftime('%H:%M:%S')}] ", "INFO")
+        console_log.insert(tk.END, "[ABORT] Loop execution block halted by operator request.\n", "FAIL")
+        console_log.configure(state='disabled')
+        btn_run.configure(state='normal')
+        btn_stop.configure(state='disabled')
+        return
+
+    if test_thread and test_thread.is_alive():
+        root.after(200, lambda: run_count_loop(total_loops, current_iteration))
+        return
+
+    if current_iteration > total_loops:
+        time_str = dt.datetime.now().strftime('%H:%M:%S')
+        console_log.configure(state='normal')
+        console_log.insert(tk.END, f"[{time_str}] ", "INFO")
+        console_log.insert(tk.END, "[INFO] Multi-loop iteration limit completed.\n", "INFO")
+        console_log.see(tk.END)
+        console_log.configure(state='disabled')
+        btn_run.configure(state='normal')
+        btn_stop.configure(state='disabled')
+        return
+
+    iter_var.set(f"Iteration: {current_iteration}")
+    root.update_idletasks()
+    
+    clear_treeview_statuses()
+    
+    test_thread = threading.Thread(target=run_one, args=(current_iteration,), daemon=True)
+    test_thread.start()
+    
+    root.after(500, lambda: run_count_loop(total_loops, current_iteration + 1))
+    
+def check_single_run_completion():
+    """Polls a standard single run task context to restore widget states dynamically."""
+    global test_thread
+    if test_thread and test_thread.is_alive():
+        root.after(200, check_single_run_completion)
+        return
+    btn_run.configure(state='normal')
+    btn_stop.configure(state='disabled')
+    
+def open_last_report():
+    """Dynamically opens the most recently generated HTML report inside the system's default web browser."""
+    report_file = last_report_path.get()
+    if not report_file or report_file == "NONE" or not os.path.exists(report_file):
+        messagebox.showinfo("Report Monitor", "No valid report file has been generated yet during this execution cycle.")
+        return
+        
+    import webbrowser
+    # Convert local absolute file system notation into a browser-safe URL string path
+    webbrowser.open(os.path.abspath(report_file))
+
+def run_tests():
+    global test_thread
+    abort_execution.set(False)
+    
+    console_log.configure(state='normal')
+    console_log.delete("1.0", tk.END)
+    console_log.configure(state='disabled')
+    
+    use = use_loop.get()
+    if use:
+        if loop_var.get() == 0:  # Count-based loop mode
+            try:
+                num = int(num_loops.get() or '1')
+                btn_run.configure(state='disabled')
+                btn_stop.configure(state='normal')
+                run_count_loop(num, 1)
+            except ValueError:
+                messagebox.showerror("Configuration Error", "Loop limit must be a valid whole number.")
+                return
+        else:  # Time-window lock loop mode
+            start_str = start_entry.get().strip()
+            stop_str = stop_entry.get().strip()
+            if not start_str or not stop_str:
+                messagebox.showerror("Configuration Error", "Both Start and Stop parameters are required.")
+                return
+            try:
+                start_dt = dt.datetime.strptime(start_str, '%Y-%m-%d %H:%M')
+                stop_dt = dt.datetime.strptime(stop_str, '%Y-%m-%d %H:%M')
+                
+                if stop_dt <= start_dt:
+                    messagebox.showerror("Configuration Error", "Stop target window must be set after the Start window constraint.")
+                    return
+                
+                btn_run.configure(state='disabled')
+                btn_stop.configure(state='normal')
+                check_and_execute_timer_loop(start_dt, stop_dt, 1)
+                
+            except ValueError:
+                messagebox.showerror("Configuration Error", "Invalid date/time format. Use YYYY-MM-DD HH:MM")
+                return
+    else:  # Standard single run execution
+        btn_run.configure(state='disabled')
+        btn_stop.configure(state='normal')
+        
+        iter_var.set("Iteration: 1")
+        root.update_idletasks()
+        clear_treeview_statuses()
+        
+        test_thread = threading.Thread(target=run_one, args=(1,), daemon=True)
+        test_thread.start()
+        
+        root.after(200, check_single_run_completion)
+
+
+def trigger_immediate_stop():
+    """Signals an internal abort request to break processing loops instantly."""
+    abort_execution.set(True)
+    console_log.configure(state='normal')
+    console_log.insert(tk.END, f"[{dt.datetime.now().strftime('%H:%M:%S')}] ", "INFO")
+    console_log.insert(tk.END, "[SYSTEM ALERT] Stop requested. Gracefully breaking execution channel...\n", "FAIL")
+    console_log.configure(state='disabled')
+    btn_stop.configure(state='disabled')
+    root.update_idletasks()
+
+
+# -------------------------------------------------------------------------
+# UI Layout Placement: Artifact Checkboxes, Action Triggers & Loop Hook
+# -------------------------------------------------------------------------
+
+frame_file_options = ttk.LabelFrame(root, text=' File Generation Artifacts ', padding=10)
+frame_file_options.pack(fill='x', padx=20, pady=(5, 10))
+
+# Nested container to hold the left-side checkboxes
+frame_checkboxes = tk.Frame(frame_file_options, bg="#2D3748")
+frame_checkboxes.pack(side='left', fill='x', expand=True)
+
+chk_gen_rep = ttk.Checkbutton(frame_checkboxes, text='Generate Report HTML', variable=generate_report)
+chk_gen_rep.pack(side='left', expand=True, padx=5)
+
+chk_gen_log = ttk.Checkbutton(frame_checkboxes, text='Generate Log HTML', variable=generate_log)
+chk_gen_log.pack(side='left', expand=True, padx=5)
+
+chk_gen_out = ttk.Checkbutton(frame_checkboxes, text='Generate Output XML', variable=generate_output)
+chk_gen_out.pack(side='left', expand=True, padx=5)
+
+
+
+# Modern secondary action style button layout pinned to the right side
+btn_view_report = ttk.Button(frame_file_options, text='📊 View Last Report', style='Primary.TButton', command=open_last_report)
+btn_view_report.pack(side='right', padx=10)
+
+
+# --- Master Running Triggers Layout ---
+frame_action_triggers = tk.Frame(root, bg="#2D3748")
+frame_action_triggers.pack(fill='x', padx=20, pady=(5, 2))
+
+btn_run = ttk.Button(frame_action_triggers, text='Run Tests', style='Run.TButton', command=run_tests)
+btn_run.pack(side='left', fill='x', expand=True, padx=(0, 5))
+
+btn_stop = ttk.Button(frame_action_triggers, text='Stop Tests', style='Danger.TButton', command=trigger_immediate_stop)
+btn_stop.pack(side='right', fill='x', expand=True, padx=(5, 0))
+btn_stop.configure(state='disabled')
+
+
+# --- Master Runtime Iteration Label Display ---
+lbl_iter = ttk.Label(root, textvariable=iter_var, font=('Segoe UI', 10, 'bold'), foreground='#A0AEC0')
+lbl_iter.pack(pady=(5, 10))
+
+
+# Fire up the Tkinter frame execution loop event engine
+root.mainloop()
