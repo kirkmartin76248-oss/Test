@@ -1,0 +1,966 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+import os
+import sys
+import json
+import time
+import threading
+import importlib.util
+import importlib
+from datetime import datetime
+
+# ==============================================================================
+# 1. HELPER CLASSES
+# ==============================================================================
+
+class DateTimePicker(tb.Toplevel):
+    def __init__(self, parent, entry_widget):
+        super().__init__(parent)
+        self.title("Select Date/Time")
+        self.entry = entry_widget
+        self.geometry("300x180")
+        
+        tb.Label(self, text="Date & Time (YYYY-MM-DD HH:MM):", bootstyle="primary").pack(pady=(15, 5))
+        self.picker = tb.Entry(self, width=25)
+        self.picker.pack(pady=5)
+        self.picker.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        
+        btn_frame = tb.Frame(self)
+        btn_frame.pack(pady=15)
+        tb.Button(btn_frame, text="Set Time", command=self.set_time, bootstyle="success").pack(side="left", padx=5)
+        tb.Button(btn_frame, text="Cancel", command=self.destroy, bootstyle="secondary").pack(side="left", padx=5)
+
+    def set_time(self):
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, self.picker.get())
+        self.destroy()
+
+class TestInfoDialog(tb.Toplevel):
+    def __init__(self, parent, current_data, save_callback):
+        super().__init__(parent)
+        self.title("Test Information & Configuration")
+        self.geometry("1000x800") # Increased height for new section
+        self.callback = save_callback
+        
+        # Main Container with scroll support if needed, but simple pack for now
+        main_pad = tb.Frame(self, padding=20)
+        main_pad.pack(fill="both", expand=True)
+
+        # --- SECTION 1: General Info ---
+        info_frame = tb.Labelframe(main_pad, text=" General Information ", padding=10, bootstyle="info")
+        info_frame.pack(fill="x", pady=(0, 10))
+
+        self.vars = {
+            "operator": tk.StringVar(value=current_data.get("operator", "")),
+            "uut_pn": tk.StringVar(value=current_data.get("uut_pn", "")),
+            "uut_sn": tk.StringVar(value=current_data.get("uut_sn", ""))
+        }
+
+        tb.Label(info_frame, text="Test Operator:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        tb.Entry(info_frame, textvariable=self.vars["operator"], width=30).grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        tb.Label(info_frame, text="UUT Part Number:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        tb.Entry(info_frame, textvariable=self.vars["uut_pn"], width=30).grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        tb.Label(info_frame, text="UUT Serial Number:").grid(row=1, column=2, padx=5, pady=5, sticky="e")
+        tb.Entry(info_frame, textvariable=self.vars["uut_sn"], width=30).grid(row=1, column=3, padx=5, pady=5, sticky="w")
+
+        # --- SECTION 2: Test Equipment ---
+        eq_frame = tb.Labelframe(main_pad, text=" Test Equipment ", padding=10, bootstyle="primary")
+        eq_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Equip Inputs
+        eq_in = tb.Frame(eq_frame)
+        eq_in.pack(fill="x", pady=(0, 5))
+        self.eq_widgets = {}
+        eq_fields = ["Description", "Asset ID", "MFR", "Model", "Cal Due"]
+        eq_widths = [25, 15, 15, 15, 15]
+        
+        for f, w in zip(eq_fields, eq_widths):
+            frm = tb.Frame(eq_in)
+            frm.pack(side="left", padx=2)
+            tb.Label(frm, text=f, font=("Segoe UI", 8)).pack(anchor="w")
+            e = tb.Entry(frm, width=w)
+            e.pack()
+            self.eq_widgets[f] = e
+
+        # Equip Buttons
+        eq_btns = tb.Frame(eq_frame)
+        eq_btns.pack(fill="x", pady=(0, 5))
+        tb.Button(eq_btns, text="Add Equip", bootstyle="success-outline", command=self.add_equip).pack(side="left", padx=2)
+        tb.Button(eq_btns, text="Remove Equip", bootstyle="danger-outline", command=self.remove_equip).pack(side="left", padx=2)
+
+        # Equip Table
+        self.tree_eq = ttk.Treeview(eq_frame, columns=eq_fields, show="headings", selectmode="browse", height=4)
+        for c in eq_fields: self.tree_eq.heading(c, text=c); self.tree_eq.column(c, width=100)
+        self.tree_eq.pack(fill="both", expand=True)
+        
+        for item in current_data.get("equipment", []): self.tree_eq.insert("", "end", values=item)
+
+        # --- SECTION 3: Requirements (NEW) ---
+        req_frame = tb.Labelframe(main_pad, text=" Test Requirements ", padding=10, bootstyle="warning")
+        req_frame.pack(fill="both", expand=True)
+
+        # Req Inputs
+        req_in = tb.Frame(req_frame)
+        req_in.pack(fill="x", pady=(0, 5))
+        
+        # ID
+        f_id = tb.Frame(req_in); f_id.pack(side="left", padx=2)
+        tb.Label(f_id, text="Req ID", font=("Segoe UI", 8)).pack(anchor="w")
+        self.req_id = tb.Entry(f_id, width=15); self.req_id.pack()
+
+        # Description
+        f_desc = tb.Frame(req_in); f_desc.pack(side="left", padx=2, fill="x", expand=True)
+        tb.Label(f_desc, text="Description", font=("Segoe UI", 8)).pack(anchor="w")
+        self.req_desc = tb.Entry(f_desc); self.req_desc.pack(fill="x")
+
+        # Type Dropdown
+        f_type = tb.Frame(req_in); f_type.pack(side="left", padx=2)
+        tb.Label(f_type, text="Type", font=("Segoe UI", 8)).pack(anchor="w")
+        self.req_type = tb.Combobox(f_type, values=["Analyze", "Inspect", "Test", "Demonstrate", "ESS"], state="readonly", width=15)
+        self.req_type.current(2) # Default to 'Test'
+        self.req_type.pack()
+
+        # Req Buttons
+        req_btns = tb.Frame(req_frame)
+        req_btns.pack(fill="x", pady=(0, 5))
+        tb.Button(req_btns, text="Add Req", bootstyle="success-outline", command=self.add_req).pack(side="left", padx=2)
+        tb.Button(req_btns, text="Remove Req", bootstyle="danger-outline", command=self.remove_req).pack(side="left", padx=2)
+
+        # Req Table
+        req_cols = ["Req ID", "Description", "Type"]
+        self.tree_req = ttk.Treeview(req_frame, columns=req_cols, show="headings", selectmode="browse", height=4)
+        self.tree_req.heading("Req ID", text="Req ID"); self.tree_req.column("Req ID", width=100)
+        self.tree_req.heading("Description", text="Description"); self.tree_req.column("Description", width=400)
+        self.tree_req.heading("Type", text="Type"); self.tree_req.column("Type", width=100)
+        self.tree_req.pack(fill="both", expand=True)
+
+        for item in current_data.get("requirements", []): self.tree_req.insert("", "end", values=item)
+
+        # Footer
+        tb.Button(main_pad, text="Save & Close", bootstyle="success", command=self.save_and_close).pack(pady=10)
+
+    # --- Equipment Logic ---
+    def add_equip(self):
+        vals = [self.eq_widgets[f].get() for f in ["Description", "Asset ID", "MFR", "Model", "Cal Due"]]
+        if any(vals):
+            self.tree_eq.insert("", "end", values=vals)
+            for w in self.eq_widgets.values(): w.delete(0, tk.END)
+    
+    def remove_equip(self):
+        sel = self.tree_eq.selection()
+        if sel: self.tree_eq.delete(sel[0])
+
+    # --- Requirements Logic ---
+    def add_req(self):
+        r_id = self.req_id.get()
+        r_desc = self.req_desc.get()
+        r_type = self.req_type.get()
+        if r_id and r_desc:
+            self.tree_req.insert("", "end", values=(r_id, r_desc, r_type))
+            self.req_id.delete(0, tk.END)
+            self.req_desc.delete(0, tk.END)
+
+    def remove_req(self):
+        sel = self.tree_req.selection()
+        if sel: self.tree_req.delete(sel[0])
+
+    def save_and_close(self):
+        data = {
+            "operator": self.vars["operator"].get(),
+            "uut_pn": self.vars["uut_pn"].get(),
+            "uut_sn": self.vars["uut_sn"].get(),
+            "equipment": [],
+            "requirements": []
+        }
+        for child in self.tree_eq.get_children():
+            data["equipment"].append(self.tree_eq.item(child)["values"])
+        for child in self.tree_req.get_children():
+            data["requirements"].append(self.tree_req.item(child)["values"])
+        
+        self.callback(data)
+        self.destroy()
+
+# ==============================================================================
+# 2. MAIN APPLICATION
+# ==============================================================================
+
+class TestGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Test Runner 47 Pro")
+        self.root.geometry("1350x900")
+        
+        # --- DATA VARIABLES ---
+        self.running = False
+        self.setup_list = []
+        self.test_list = []
+        self.cleanup_list = []
+        
+        self.seq_setup = []
+        self.seq_test = []
+        self.seq_cleanup = []
+        
+        self.test_data = [] 
+        self.skipped_tests = set()
+        
+        self.main_pass_count = 0
+        self.main_fail_count = 0        
+        self.execution_start_dt = None
+        self.execution_end_dt = None
+        self.last_report_file = ""
+
+        # --- NEW: Test Info Store ---
+        self.test_info_data = {
+            "operator": "", 
+            "uut_pn": "", 
+            "uut_sn": "", 
+            "equipment": [],
+            "requirements": [] # <--- ADD THIS
+        }
+
+        # --- PROGRESS STATE ---
+        self.current_progress_val = 0.0
+        self.current_progress_max = 100.0
+
+        # --- WINDOW STATE ---
+        self.log_window = None 
+
+        # --- CONTROL VARIABLES ---
+        self.loop_var = tk.StringVar(value="none")
+        
+        # --- INITIALIZATION ---
+        self.create_gui()
+        self.update_file_list()
+        self.load_default_config() # Auto-load if exists
+        
+    # ==========================================================================
+    # GUI LAYER
+    # ==========================================================================
+    def create_gui(self):
+        for widget in self.root.winfo_children(): widget.destroy()
+
+        main = tb.Frame(self.root, padding=10)
+        main.pack(fill="both", expand=True)
+
+        # --- TOP ROW ---
+        top = tb.Frame(main)
+        top.pack(fill="both", expand=True, pady=(0, 10))
+
+        # COL 1: Library
+        lib_frame = tb.Labelframe(top, text=" 📂 Script Library ", bootstyle="primary", padding=10)
+        lib_frame.pack(side="left", fill="y", padx=(0, 10))
+        
+        self.file_listbox = tk.Listbox(lib_frame, width=30, font=("Segoe UI", 10), borderwidth=0)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        scr = tb.Scrollbar(lib_frame, orient="vertical", command=self.file_listbox.yview)
+        scr.pack(side="right", fill="y")
+        self.file_listbox.config(yscrollcommand=scr.set)
+        tb.Button(lib_frame, text="Refresh List", bootstyle="link", command=self.update_file_list).pack(side="bottom", fill="x")
+
+        # COL 2: Builder
+        center = tb.Frame(top)
+        center.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+        # Staging Lists
+        stages = tb.Labelframe(center, text=" 🛠️ Sequence Builder ", bootstyle="info", padding=10)
+        stages.pack(side="top", fill="x", pady=(0, 10))
+
+        def make_stage(parent, title, color, add_cmd, remove_cmd):
+            f = tb.Frame(parent)
+            f.pack(side="left", fill="both", expand=True, padx=5)
+            tb.Button(f, text=f"✚ {title}", bootstyle=f"{color}-outline", command=add_cmd).pack(fill="x", pady=2)
+            lb = tk.Listbox(f, height=6, borderwidth=1, relief="solid", font=("Segoe UI", 9))
+            lb.pack(fill="both", expand=True)
+            tb.Button(f, text="Remove", bootstyle=f"{color}-link", command=remove_cmd).pack(fill="x")
+            return lb
+
+        self.setup_listbox = make_stage(stages, "Setup", "warning", lambda: self.add_to_list("setup"), lambda: self.remove_from_list("setup"))
+        self.test_listbox = make_stage(stages, "Test", "info", lambda: self.add_to_list("test"), lambda: self.remove_from_list("test"))
+        self.cleanup_listbox = make_stage(stages, "Cleanup", "secondary", lambda: self.add_to_list("cleanup"), lambda: self.remove_from_list("cleanup"))
+
+        # Tree View
+        tb.Label(center, text="Full Execution Plan:", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(5,0))
+        tree_con = tb.Frame(center)
+        tree_con.pack(side="top", fill="both", expand=True)
+        self.tree = tb.Treeview(tree_con, columns=("col1"), show="tree", bootstyle="info")
+        self.tree.pack(side="left", fill="both", expand=True)
+        t_scr = tb.Scrollbar(tree_con, orient="vertical", command=self.tree.yview)
+        t_scr.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=t_scr.set)
+
+        # COL 3: Actions
+        actions = tb.Frame(top, width=200)
+        actions.pack(side="right", fill="y")
+        
+        self.theme_btn = tb.Button(actions, text="🌙 Dark Mode", bootstyle="dark-outline", command=self.toggle_theme)
+        self.theme_btn.pack(fill="x", pady=(0, 10))
+
+        # Test Info Button (NEW)
+        tb.Button(actions, text="📋 Test Info", bootstyle="secondary", command=self.open_test_info).pack(fill="x", pady=(0, 10))
+
+        grp_file = tb.Labelframe(actions, text=" File Ops ", padding=10)
+        grp_file.pack(fill="x", pady=(0, 10))
+        tb.Button(grp_file, text="💾 Save", bootstyle="outline", command=self.save_config).pack(fill="x", pady=2)
+        tb.Button(grp_file, text="📂 Load", bootstyle="outline", command=self.load_config).pack(fill="x", pady=2)
+
+        grp_run = tb.Labelframe(actions, text=" Control ", padding=10, bootstyle="danger")
+        grp_run.pack(fill="x")
+        self.run_btn = tb.Button(grp_run, text="▶ RUN", bootstyle="success", command=self.run_tests_thread)
+        self.run_btn.pack(fill="x", pady=5)
+        self.cancel_btn = tb.Button(grp_run, text="⏹ STOP", bootstyle="danger", command=self.cancel_tests)
+        self.cancel_btn.pack(fill="x", pady=5)
+        tb.Button(grp_run, text="⏭ Skip", bootstyle="warning-outline", command=self.toggle_skipped).pack(fill="x", pady=5)
+        self.open_btn = tb.Button(grp_run, text="📂 Report", bootstyle="info", state="disabled", command=self.open_last_report)
+        self.open_btn.pack(fill="x", pady=2)
+
+        # --- BOTTOM ROW ---
+        settings = tb.Labelframe(main, text=" ⚙️ Loop Settings ", padding=15)
+        settings.pack(side="top", fill="x", pady=(0, 10))
+        
+        tb.Label(settings, text="Mode:", font=("Segoe UI", 9, "bold")).pack(side="left", padx=10)
+        tb.Radiobutton(settings, text="Single", variable=self.loop_var, value="none", bootstyle="toolbutton").pack(side="left", padx=2)
+        tb.Radiobutton(settings, text="Count", variable=self.loop_var, value="count", bootstyle="toolbutton").pack(side="left", padx=2)
+        tb.Radiobutton(settings, text="Time", variable=self.loop_var, value="time", bootstyle="toolbutton").pack(side="left", padx=2)
+        
+        tb.Separator(settings, orient="vertical").pack(side="left", fill="y", padx=15)
+        tb.Label(settings, text="Count:").pack(side="left")
+        self.loop_count = tb.Spinbox(settings, from_=1, to=999, width=5)
+        self.loop_count.pack(side="left", padx=5)
+        
+        # Start Time
+        tb.Label(settings, text="Start:").pack(side="left", padx=(15, 5))
+        self.start_time = tb.Entry(settings, width=16)
+        self.start_time.pack(side="left")
+        
+        # Calendar Icon 1 (Using Label for Font support)
+        cal_btn1 = tb.Label(settings, text="🕘", font=("Segoe UI", 16), cursor="hand2", bootstyle="primary")
+        cal_btn1.pack(side="left", padx=5)
+        cal_btn1.bind("<Button-1>", lambda e: DateTimePicker(self.root, self.start_time))
+
+        # End Time
+        tb.Label(settings, text="End:").pack(side="left", padx=(15, 5))
+        self.end_time = tb.Entry(settings, width=16)
+        self.end_time.pack(side="left")
+        
+        # Calendar Icon 2
+        cal_btn2 = tb.Label(settings, text="🕤", font=("Segoe UI", 16), cursor="hand2", bootstyle="primary")
+        cal_btn2.pack(side="left", padx=5)
+        cal_btn2.bind("<Button-1>", lambda e: DateTimePicker(self.root, self.end_time))
+
+
+        # --- LIVE MONITOR & DETACHABLE LOG ---
+        self.mon_frame = tb.Labelframe(main, text=" 📺 Status Log ", padding=10, bootstyle="success")
+        self.mon_frame.pack(side="top", fill="both", expand=True)
+        
+        mon_header = tb.Frame(self.mon_frame)
+        mon_header.pack(fill="x", pady=(0, 5))
+        tb.Label(mon_header, text="Live Execution Output:", font=("Segoe UI", 9, "italic")).pack(side="left")
+        tb.Button(mon_header, text="↗ Pop Out", bootstyle="link", command=self.pop_out_log).pack(side="right")
+
+        self.log_frame_embedded = tb.Frame(self.mon_frame)
+        self.log_frame_embedded.pack(fill="both", expand=True)
+
+        log_scroll = tb.Scrollbar(self.log_frame_embedded, orient="vertical")
+        log_scroll.pack(side="right", fill="y")
+
+        self.text_embedded = tb.Text(self.log_frame_embedded, height=15, font=("Consolas", 10), yscrollcommand=log_scroll.set)
+        self.text_embedded.pack(side="left", fill="both", expand=True)
+        log_scroll.config(command=self.text_embedded.yview)
+        
+        self.configure_tags(self.text_embedded)
+        self.results_text = self.text_embedded
+        self.log_history = [] 
+
+        foot = tb.Frame(self.mon_frame)
+        foot.pack(fill="x", pady=(10, 0))
+        self.timer_label = tb.Label(foot, text="Ready", font=("Consolas", 11, "bold"))
+        self.timer_label.pack(side="left")
+        self.progress = tb.Progressbar(foot, bootstyle="success-striped", mode="determinate")
+        self.progress.pack(side="right", fill="x", expand=True, padx=(15, 0))
+
+    # ==========================================================================
+    # ACTIONS
+    # ==========================================================================
+    
+    def open_test_info(self):
+        TestInfoDialog(self.root, self.test_info_data, self.update_test_info)
+
+    def update_test_info(self, data):
+        self.test_info_data = data
+        self.safe_log("Info Updated: Operator, UUT, & Equipment Saved.\n", "info")
+
+    def configure_tags(self, widget):
+        widget.tag_config("pass", foreground="#28a745")
+        widget.tag_config("fail", foreground="#dc3545")
+        widget.tag_config("skip", foreground="#f39c12")
+        widget.tag_config("info", foreground="#17a2b8")
+        widget.tag_config("iter", foreground="#17a2b8", font=("Consolas", 10, "bold"))
+        widget.tag_config("phase", foreground="#6c757d", font=("Consolas", 10, "bold"))
+
+    def rebuild_log_content(self, target_widget):
+        self.configure_tags(target_widget)
+        self.apply_theme_colors(target_widget)
+        target_widget.delete("1.0", "end")
+        for msg, tags in self.log_history:
+            target_widget.insert("end", msg, tags)
+        target_widget.see("end")
+
+    def pop_out_log(self):
+        if self.log_window is not None:
+            self.log_window.lift()
+            return
+        self.log_window = tb.Toplevel(self.root)
+        self.log_window.title("Status Log (Detached)")
+        self.log_window.geometry("700x600")
+        self.log_window.protocol("WM_DELETE_WINDOW", self.dock_log)
+        f = tb.Frame(self.log_window)
+        f.pack(fill="both", expand=True, padx=10, pady=10)
+        scr = tb.Scrollbar(f, orient="vertical")
+        scr.pack(side="right", fill="y")
+        self.text_detached = tb.Text(f, font=("Consolas", 11), yscrollcommand=scr.set)
+        self.text_detached.pack(side="left", fill="both", expand=True)
+        scr.config(command=self.text_detached.yview)
+        self.rebuild_log_content(self.text_detached)
+        self.results_text = self.text_detached
+        self.log_frame_embedded.pack_forget()
+
+    def dock_log(self):
+        if self.log_window:
+            self.results_text = self.text_embedded
+            self.rebuild_log_content(self.text_embedded)
+            self.log_frame_embedded.pack(fill="both", expand=True, before=self.mon_frame.winfo_children()[-1])
+            self.log_window.destroy()
+            self.log_window = None
+
+    def apply_theme_colors(self, widget):
+        is_dark = self.root.style.theme.name == 'superhero'
+        if is_dark:
+            widget.configure(bg="#2b3e50", fg="white", insertbackground="white")
+        else:
+            widget.configure(bg="white", fg="black", insertbackground="black")
+
+    def toggle_theme(self):
+        current = self.root.style.theme.name
+        if current == 'cosmo':
+            self.root.style.theme_use('superhero')
+            self.theme_btn.configure(text="☀️ Light Mode", bootstyle="light-outline")
+        else:
+            self.root.style.theme_use('cosmo')
+            self.theme_btn.configure(text="🌙 Dark Mode", bootstyle="dark-outline")
+        self.apply_theme_colors(self.results_text)
+
+    def update_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        try:
+            files = [f for f in os.listdir('.') if f.endswith('.py') and f != os.path.basename(__file__)]
+            for f in files: self.file_listbox.insert(tk.END, f)
+        except Exception: pass
+
+    def extract_subtests(self, filename):
+        subtests = []
+        try:
+            if os.getcwd() not in sys.path: sys.path.append(os.getcwd())
+            mod_name = filename.replace('.py', '')
+            spec = importlib.util.spec_from_file_location(mod_name, filename)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if hasattr(mod, 'get_subtests'):
+                    subtests = mod.get_subtests()
+        except Exception: pass
+        return subtests
+
+    def update_tree(self):
+        for item in self.tree.get_children(): self.tree.delete(item)
+        def add_sec(title, file_list, icon):
+            if not file_list: return
+            head = self.tree.insert("", "end", text=title, open=True, tags=('head',))
+            for f in file_list:
+                node = self.tree.insert(head, "end", text=f"{icon} {f}", open=True)
+                subs = self.extract_subtests(f)
+                if subs:
+                    for s in subs: self.tree.insert(node, "end", text=f"   • {s}", tags=('sub',))
+                else:
+                    self.tree.insert(node, "end", text="   (No Subtests Detected)", tags=('gray',))
+        add_sec("Setup", self.setup_list, "📄")
+        add_sec("Test", self.test_list, "🧪")
+        add_sec("Cleanup", self.cleanup_list, "🧹")
+        self.tree.tag_configure('head', font=("Segoe UI", 9, "bold"))
+        self.tree.tag_configure('sub', foreground="gray")
+
+    def add_to_list(self, type_):
+        f = self.get_sel()
+        if f:
+            getattr(self, f"{type_}_list").append(f)
+            getattr(self, f"{type_}_listbox").insert(tk.END, f)
+            self.update_tree()
+
+    def remove_from_list(self, type_):
+        box = getattr(self, f"{type_}_listbox")
+        if box.curselection():
+            i = box.curselection()[0]
+            box.delete(i)
+            del getattr(self, f"{type_}_list")[i]
+            self.update_tree()
+
+    def get_sel(self):
+        try: return self.file_listbox.get(self.file_listbox.curselection()[0])
+        except: return None
+
+    def toggle_skipped(self):
+        sel = self.tree.selection()
+        if not sel: return
+        item_id = sel[0]
+        raw_text = self.tree.item(item_id, "text")
+        is_skipping = "- Skipping" in raw_text
+        clean_text = raw_text.replace(" - Skipping", "")
+        db_id = clean_text.replace("   • ", "")
+        for icon in ["📄 ", "🧪 ", "🧹 "]:
+            db_id = db_id.replace(icon, "")
+        if is_skipping:
+            self.skipped_tests.discard(db_id)
+            self.tree.item(item_id, text=clean_text)
+            self.safe_log(f"Unskipping: {db_id}\n", "skip")
+        else:
+            self.skipped_tests.add(db_id)
+            self.tree.item(item_id, text=f"{clean_text} - Skipping")
+            self.safe_log(f"Skipping: {db_id}\n", "skip")
+
+    def open_last_report(self):
+        if self.last_report_file and os.path.exists(self.last_report_file): os.startfile(self.last_report_file)
+    
+    def save_config(self):
+        d = {
+            "setup": self.setup_list, 
+            "test": self.test_list, 
+            "cleanup": self.cleanup_list, 
+            "loop": self.loop_var.get(), 
+            "count": self.loop_count.get(),
+            "test_info": self.test_info_data # Save Info
+        }
+        f = filedialog.asksaveasfilename(defaultextension=".json")
+        if f: 
+            with open(f, 'w') as o: json.dump(d, o)
+            self.safe_log(f"Saved {os.path.basename(f)}\n", "info")
+            
+    def load_config(self):
+        f = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+        if f: self.load_config_file(f)
+
+    def load_config_file(self, path):
+        try:
+            with open(path, 'r') as i: d = json.load(i)
+            self.setup_list = d.get("setup", [])
+            self.test_list = d.get("test", [])
+            self.cleanup_list = d.get("cleanup", [])
+            self.loop_var.set(d.get("loop", "none"))
+            self.loop_count.delete(0, tk.END); self.loop_count.insert(0, d.get("count", 1))
+            self.test_info_data = d.get("test_info", {"operator": "", "uut_pn": "", "uut_sn": "", "equipment": []})
+            
+            self.setup_listbox.delete(0, tk.END); 
+            for x in self.setup_list: self.setup_listbox.insert(tk.END, x)
+            self.test_listbox.delete(0, tk.END); 
+            for x in self.test_list: self.test_listbox.insert(tk.END, x)
+            self.cleanup_listbox.delete(0, tk.END); 
+            for x in self.cleanup_list: self.cleanup_listbox.insert(tk.END, x)
+            self.update_tree()
+            self.safe_log(f"Loaded {os.path.basename(path)}\n", "info")
+        except Exception as e:
+            self.safe_log(f"Err loading config: {e}\n", "fail")
+
+    def load_default_config(self):
+        if os.path.exists("default_config.json"):
+            self.load_config_file("default_config.json")
+
+    # ==========================================================================
+    # EXECUTION ENGINE
+    # ==========================================================================
+
+    def make_test(self):
+        self.seq_setup = []
+        self.seq_test = []
+        self.seq_cleanup = []
+        def fill_queue(source, target, phase):
+            for f in source:
+                subs = self.extract_subtests(f)
+                if subs:
+                    for s in subs: target.append((f, s, phase))
+                else:
+                    target.append((f, "Main", phase))
+        fill_queue(self.setup_list, self.seq_setup, "Setup")
+        fill_queue(self.test_list, self.seq_test, "Test")
+        fill_queue(self.cleanup_list, self.seq_cleanup, "Cleanup")
+        total = len(self.seq_setup) + len(self.seq_test) + len(self.seq_cleanup)
+        self.safe_log(f"Plan: {total} steps (S:{len(self.seq_setup)} T:{len(self.seq_test)} C:{len(self.seq_cleanup)})\n", "info")
+
+    def run_tests_thread(self):
+        if self.running: return
+        self.running = True
+        self.make_test()
+        threading.Thread(target=self.execute_tests, daemon=True).start()
+
+    def cancel_tests(self):
+        self.running = False
+        self.safe_log("\n>>> STOPPING <<<\n", "fail")
+
+    def execute_tests(self):
+        self.safe_clear_log()
+        self.log_history = []
+        self.safe_ui(False)
+        self.test_data = [] 
+        self.main_pass_count = 0
+        self.main_fail_count = 0
+        
+        loop_type = self.loop_var.get()
+        try: count_limit = int(self.loop_count.get())
+        except: count_limit = 1
+        
+        s_str = self.start_time.get()
+        if loop_type == "time" and s_str:
+            try:
+                s_dt = datetime.strptime(s_str, "%Y-%m-%d %H:%M")
+                if s_dt > datetime.now():
+                    self.safe_log(f"Waiting for {s_dt}...\n", "info")
+                    self.safe_prog(0, mode="indeterminate")
+                    while self.running and datetime.now() < s_dt:
+                        rem = int((s_dt - datetime.now()).total_seconds())
+                        self.safe_timer(f"Starts in: {rem}s")
+                        time.sleep(0.5)
+            except: pass
+
+        self.execution_start_dt = datetime.now()
+        self.safe_prog(0, mode="determinate")
+        
+        e_str = self.end_time.get()
+        end_dt = None
+        if loop_type == "time" and e_str:
+            try:
+                end_dt = datetime.strptime(e_str, "%Y-%m-%d %H:%M")
+                total = (end_dt - self.execution_start_dt).total_seconds()
+                self.safe_prog(0, max_val=max(total, 1))
+            except: pass
+        else:
+            # PERCENTAGE
+            self.safe_prog(0, max_val=100)
+            has_setup = len(self.seq_setup) > 0
+            has_cleanup = len(self.seq_cleanup) > 0
+            share_setup = 10.0 if has_setup else 0.0
+            share_cleanup = 10.0 if has_cleanup else 0.0
+            share_tests = 100.0 - share_setup - share_cleanup
+            eff_loops = count_limit if loop_type == "count" else 1
+            inc_setup = share_setup
+            inc_cleanup = share_cleanup
+            total_test_steps = len(self.seq_test) * eff_loops
+            inc_per_test = share_tests / total_test_steps if total_test_steps > 0 else 0
+            self.current_progress_val = 0.0
+
+        self.update_ui_loop()
+
+        # SETUP
+        if self.seq_setup and self.running:
+            self.safe_log("\n--- Setup Phase ---\n", "phase")
+            for item in self.seq_setup:
+                if not self.running: break
+                self.run_step_wrapper(item, "Setup")
+            if loop_type != "time":
+                self.current_progress_val += inc_setup
+                self.safe_prog(self.current_progress_val)
+
+        # LOOP
+        iteration = 0
+        while self.running:
+            if loop_type == "none" and iteration >= 1: break
+            if loop_type == "count" and iteration >= count_limit: break
+            if loop_type == "time" and end_dt and datetime.now() > end_dt: break
+            
+            self.safe_log(f"\n=== Iteration {iteration + 1} ===\n", "iter")
+            for item in self.seq_test:
+                if not self.running: break
+                self.run_step_wrapper(item, iteration + 1)
+                if loop_type != "time":
+                    self.current_progress_val += inc_per_test
+                    self.safe_prog(self.current_progress_val)
+            iteration += 1
+
+        # CLEANUP
+        if self.seq_cleanup and self.running:
+            self.safe_log("\n--- Cleanup Phase ---\n", "phase")
+            for item in self.seq_cleanup:
+                if not self.running: break
+                self.run_step_wrapper(item, "Cleanup")
+            if loop_type != "time":
+                self.current_progress_val += inc_cleanup
+                self.safe_prog(self.current_progress_val)
+
+        self.running = False
+        self.execution_end_dt = datetime.now()
+        self.safe_log("\n--- Finished ---\n", "pass")
+        if loop_type != 'time': self.safe_prog(100)
+        else: self.safe_prog(0)
+        self.generate_report()
+        self.safe_ui(True)
+
+    def run_step_wrapper(self, item, iteration_val):
+        fname, sub, phase = item
+        if (sub in self.skipped_tests or f"{fname}:{sub}" in self.skipped_tests or fname in self.skipped_tests):
+            self.safe_log(f"Skipped: {sub}\n", "skip")
+            self.test_data.append({
+                "Time": datetime.now().strftime("%H:%M:%S"), 
+                "Iteration": str(iteration_val), "File": fname, "Test": sub, "Value": "N/A", 
+                "Status": "SKIPPED", "Duration": "0.00s"
+            })
+            return
+        self.run_single_test(fname, sub, phase, iteration_val)
+
+    def update_ui_loop(self):
+        if self.running:
+            elapsed = datetime.now() - self.execution_start_dt
+            txt = str(elapsed).split('.')[0]
+            self.safe_timer(f"Elapsed: {txt}")
+            if self.loop_var.get() == "time": self.progress["value"] = elapsed.total_seconds()
+            self.root.after(100, self.update_ui_loop)
+
+    def run_single_test(self, filename, subtest_string, phase_type, iteration_val):
+        start_t = datetime.now()
+        status = "FAIL"
+        value = "Error"
+        try:
+            if os.getcwd() not in sys.path: sys.path.append(os.getcwd())
+            mod_name = filename.replace('.py', '')
+            spec = importlib.util.spec_from_file_location(mod_name, filename)
+            if not spec or not spec.loader: raise ImportError("Load Fail")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            parts = subtest_string.split(':')
+            func_name = parts[0]
+            args = []
+            for a in parts[1:]:
+                try: args.append(float(a) if '.' in a else int(a))
+                except: args.append(a)
+            self.safe_log(f"Exec: {func_name}{tuple(args)}...", "info")
+            if hasattr(module, func_name):
+                func = getattr(module, func_name)
+                ret = func(*args) 
+                captured_val = str(ret)
+                is_success = False
+                if isinstance(ret, (tuple, list)) and len(ret) == 2:
+                    captured_val = ret[0]; is_success = ret[1]
+                elif isinstance(ret, bool):
+                    captured_val = str(ret); is_success = ret
+                else:
+                    captured_val = str(ret); is_success = True if ret is not None else False
+                value = str(captured_val)
+                if is_success:
+                    status = "PASS"
+                    self.safe_log(f" PASS ({value})\n", "pass")
+                    self.main_pass_count += 1
+                else:
+                    status = "FAIL"
+                    self.safe_log(f" FAIL ({value})\n", "fail")
+                    self.main_fail_count += 1
+                if "FATAL" in value.upper():
+                    self.safe_log(f" >>> FATAL HALT <<<\n", "fail")
+                    self.running = False
+            elif subtest_string == "Main":
+                status = "PASS"; value = "File Run"; self.safe_log(" OK\n", "pass"); self.main_pass_count += 1
+            else:
+                self.safe_log(f" FAIL (No Func)\n", "fail"); self.main_fail_count += 1
+        except Exception as e:
+            value = str(e); self.safe_log(f" CRASH: {e}\n", "fail"); self.main_fail_count += 1
+        duration = (datetime.now() - start_t).total_seconds()
+        self.test_data.append({
+            "Time": datetime.now().strftime("%H:%M:%S"), "Iteration": str(iteration_val),
+            "File": filename, "Test": subtest_string, "Value": value, "Status": status, "Duration": f"{duration:.2f}s"
+        })
+
+    def generate_report(self):
+        t_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        fname = f"Report_{t_str}.html"
+        is_dark = self.root.style.theme.name == 'superhero'
+        
+        bg_color = "#2b3e50" if is_dark else "#f8f9fa"
+        card_bg = "#4e5d6c" if is_dark else "white"
+        text_color = "#ffffff" if is_dark else "#333333"
+        header_bg = "#20374c" if is_dark else "#2c3e50"
+        border_color = "#555" if is_dark else "#e9ecef"
+        iter_row_bg = "#324a5f" if is_dark else "#e3eefc"
+        iter_row_text = "#81d4fa" if is_dark else "#1e3799"
+        
+        total = len(self.test_data)
+        passed = self.main_pass_count
+        failed = self.main_fail_count
+        skipped = sum(1 for x in self.test_data if x['Status'] == "SKIPPED")
+        rate = round((passed/total)*100, 1) if total > 0 else 0
+        
+        start_ts = self.execution_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_ts = self.execution_end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        duration = str(self.execution_end_dt - self.execution_start_dt).split('.')[0]
+
+        info = self.test_info_data
+        
+        # Build Equip Rows
+        equip_rows = ""
+        for eq in info.get("equipment", []):
+            equip_rows += f"<tr><td>{eq[0]}</td><td>{eq[1]}</td><td>{eq[2]}</td><td>{eq[3]}</td><td>{eq[4]}</td></tr>"
+
+        # Build Requirement Rows
+        req_rows = ""
+        for req in info.get("requirements", []):
+            req_rows += f"<tr><td>{req[0]}</td><td>{req[1]}</td><td>{req[2]}</td></tr>"
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Test Report</title>
+            <style>
+                body {{ font-family: 'Segoe UI', sans-serif; background: {bg_color}; margin: 20px; color: {text_color}; font-size: 12px; }}
+                
+                /* COMPACT CARD */
+                .card {{ background: {card_bg}; border-radius: 8px; padding: 15px; max-width: 1000px; margin: 0 auto; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                
+                /* COMPACT HEADERS */
+                h1 {{ text-align: center; margin: 0 0 10px 0; color: {text_color}; font-size: 20px; }}
+                h2 {{ font-size: 14px; margin-top: 10px; border-bottom: 2px solid {header_bg}; padding-bottom: 2px; margin-bottom: 5px; }}
+                
+                /* COMPACT SUMMARY */
+                .summary {{ display: flex; justify-content: space-between; background: {header_bg}; padding: 8px; border-radius: 4px; margin-bottom: 10px; }}
+                .stat {{ text-align: center; flex: 1; color: white; }}
+                .stat-label {{ font-size: 10px; font-weight: bold; opacity: 0.8; display: block; text-transform: uppercase; }}
+                .stat-value {{ font-size: 16px; font-weight: bold; }}
+                .val-green {{ color: #2ecc71; }} .val-red {{ color: #e74c3c; }} .val-skip {{ color: #f39c12; }}
+                
+                /* COMPACT TABLES */
+                table {{ width: 100%; border-collapse: collapse; font-size: 11px; color: {text_color}; margin-bottom: 10px; table-layout: fixed; }}
+                thead {{ background-color: {header_bg}; color: white; }}
+                th {{ padding: 4px 6px; text-align: left; }}
+                td {{ padding: 4px 6px; border-bottom: 1px solid {border_color}; word-wrap: break-word; overflow-wrap: break-word; vertical-align: top; }}
+                
+                /* Column Widths for Logs */
+                .log-table th:nth-child(1) {{ width: 10%; }} 
+                .log-table th:nth-child(2) {{ width: 18%; }} 
+                .log-table th:nth-child(3) {{ width: 18%; }} 
+                .log-table th:nth-child(4) {{ width: 8%; }}  
+                .log-table th:nth-child(5) {{ width: 40%; }} 
+                .log-table th:nth-child(6) {{ width: 6%; }} 
+
+                .badge {{ padding: 2px 6px; border-radius: 3px; font-weight: bold; color: white; font-size: 9px; display: inline-block; min-width: 35px; text-align: center; }}
+                .PASS {{ background-color: #2ecc71; }} .FAIL {{ background-color: #e74c3c; }} .SKIPPED {{ background-color: #f1c40f; }}
+                
+                .file-name {{ font-style: italic; opacity: 0.8; }} .test-func {{ font-weight: 600; }}
+                .iter-row td {{ background-color: {iter_row_bg}; font-weight: bold; color: {iter_row_text}; border-top: 1px solid {border_color}; text-align: left; padding: 3px 6px; }}
+                .file-sep td {{ border-top: 2px double #95a5a6; }}
+                
+                /* COMPACT INFO GRID */
+                .info-grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; margin-bottom: 10px; }}
+                .info-box {{ background: {iter_row_bg}; padding: 4px 8px; border-radius: 3px; border: 1px solid {border_color}; }}
+                .info-label {{ font-weight: bold; display: block; font-size: 10px; opacity: 0.7; margin-bottom: 1px; }}
+                
+                @media print {{
+                    body {{ margin: 0; background: white; font-size: 10px; }}
+                    .card {{ box-shadow: none; border: none; width: 100%; max-width: 100%; padding: 0; }}
+                    tr {{ page-break-inside: avoid; }}
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h1>Test Execution Report</h1>
+                
+                <h2>Test Information</h2>
+                <div class="info-grid">
+                    <div class="info-box"><span class="info-label">Operator</span>{info.get('operator','')}</div>
+                    <div class="info-box"><span class="info-label">UUT Part Number</span>{info.get('uut_pn','')}</div>
+                    <div class="info-box"><span class="info-label">UUT Serial Number</span>{info.get('uut_sn','')}</div>
+                    <div class="info-box"><span class="info-label">Start Time</span>{start_ts}</div>
+                    <div class="info-box"><span class="info-label">End Time</span>{end_ts}</div>
+                    <div class="info-box"><span class="info-label">Total Duration</span>{duration}</div>
+                </div>
+
+                <h2>Requirements Verification</h2>
+                <table style="table-layout: auto;">
+                    <thead><tr><th>Req ID</th><th>Description</th><th>Type</th></tr></thead>
+                    <tbody>{req_rows}</tbody>
+                </table>
+
+                <h2>Equipment List</h2>
+                <table style="table-layout: auto;">
+                    <thead><tr><th>Description</th><th>Asset ID</th><th>MFR</th><th>Model</th><th>Cal Due</th></tr></thead>
+                    <tbody>{equip_rows}</tbody>
+                </table>
+
+                <h2>Execution Summary</h2>
+                <div class="summary">
+                    <div class="stat"><span class="stat-label">Total</span><span class="stat-value">{total}</span></div>
+                    <div class="stat"><span class="stat-label">Passed</span><span class="stat-value val-green">{passed}</span></div>
+                    <div class="stat"><span class="stat-label">Failed</span><span class="stat-value val-red">{failed}</span></div>
+                    <div class="stat"><span class="stat-label">Skipped</span><span class="stat-value val-skip">{skipped}</span></div>
+                    <div class="stat"><span class="stat-label">Rate</span><span class="stat-value">{rate}%</span></div>
+                </div>
+
+                <h2>Detailed Logs</h2>
+                <table class="log-table">
+                    <thead><tr><th>Time</th><th>File</th><th>Test Function</th><th>Result</th><th>Value</th><th>Duration</th></tr></thead>
+                    <tbody>
+        """
+        
+        last_iter = None; last_file = None
+        for r in self.test_data:
+            curr_iter = r['Iteration']; curr_file = r['File']
+            if curr_iter != last_iter:
+                label = f"Phase: {curr_iter}" if curr_iter in ["Setup", "Cleanup"] else f"Iteration {curr_iter}"
+                html += f"<tr class='iter-row'><td colspan='6'>{label}</td></tr>"
+                last_iter = curr_iter; last_file = None
+            tr_class = "file-sep" if last_file and curr_file != last_file else ""
+            last_file = curr_file
+            st = r['Status'] if r['Status'] in ['PASS','FAIL','SKIPPED'] else 'FAIL'
+            html += f"""<tr class='{tr_class}'><td>{r['Time']}</td><td class="file-name">{r['File']}</td><td class="test-func">{r['Test']}</td><td><span class="badge {st}">{st}</span></td><td>{r['Value']}</td><td>{r['Duration']}</td></tr>"""
+        
+        html += """</tbody></table></div></body></html>"""
+        with open(fname, "w", encoding="utf-8") as f: f.write(html)
+        self.last_report_file = fname
+        self.safe_log(f"\n📄 Report Saved: {fname}\n", "info")
+
+    # --- THREAD BRIDGES ---
+    def safe_log(self, msg, tags=None):
+        self.log_history.append((msg, tags))
+        self.root.after(0, lambda: (self.results_text.insert(tk.END, msg, tags), self.results_text.see(tk.END)))
+    def safe_clear_log(self):
+        self.log_history = []
+        self.root.after(0, lambda: self.results_text.delete(1.0, tk.END))
+    def safe_prog(self, val, max_val=None, mode=None):
+        def _up():
+            if max_val is not None: self.progress["maximum"] = max_val
+            if mode: 
+                self.progress["mode"] = mode
+                if mode == 'indeterminate': self.progress.start(10)
+                else: self.progress.stop()
+            self.progress["value"] = val
+        self.root.after(0, _up)
+    def safe_timer(self, txt):
+        self.root.after(0, lambda: self.timer_label.config(text=txt))
+    def safe_ui(self, enable):
+        state = "normal" if enable else "disabled"
+        self.root.after(0, lambda: self.open_btn.config(state=state))
+def create_template_test_file(filename="template_test.py"):
+    template = """
+def get_subtests():
+    return ['push:2:10', 'push:12:20', 'push:43:30']
+
+def run_test():
+    pass
+
+def push(number, increment):
+    print(f"Running push with number {number}, increment {increment}")
+    return (int(number) + int(increment), int(number) > 10)
+"""
+    with open(filename, "w") as f:
+        f.write(template)
+        
+if __name__ == "__main__":
+    create_template_test_file()
+    root = tb.Window(themename="cosmo")
+    app = TestGUI(root)
+    root.mainloop()
